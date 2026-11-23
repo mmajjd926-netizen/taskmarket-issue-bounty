@@ -1,0 +1,129 @@
+# Turn a labeled GitHub issue into an escrowed Taskmarket bounty.
+# Trigger: a maintainer adds the label "taskmarket" to an issue.
+# Safe by default: runs as a DRY RUN until you set the repository variable TASKMARKET_DRY_RUN=false.
+name: Taskmarket bounty from label
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: taskmarket-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  post-bounty:
+    if: github.event.label.name == 'taskmarket'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Settings (Settings -> Secrets and variables -> Actions -> Variables). Defaults in quotes.
+      DRY_RUN: ${{ vars.TASKMARKET_DRY_RUN || 'true' }}
+      TASKMARKET_NETWORK: ${{ vars.TASKMARKET_NETWORK || 'tempo' }}
+      REWARD: ${{ vars.TASKMARKET_REWARD || '5' }}
+      DURATION_HOURS: ${{ vars.TASKMARKET_DURATION_HOURS || '72' }}
+      # Issue fields arrive as environment variables, never pasted into the script (no shell injection).
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
+      ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ' ') }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Skip if this issue already has a bounty
+        id: guard
+        run: |
+          if gh issue view "$ISSUE_NUMBER" --json comments --jq '.comments[].body' | grep -q '<!-- taskmarket-bounty:posted -->'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Issue #$ISSUE_NUMBER already has a Taskmarket bounty; nothing to do."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          node-version: 22
+
+      - name: Install the Taskmarket CLI
+        if: steps.guard.outputs.skip != 'true'
+        run: npm i -g @lucid-agents/taskmarket
+
+      - name: Build the task
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          # Optional per-issue reward: add a label like "reward-10" next to "taskmarket".
+          for l in $ISSUE_LABELS; do
+            case "$l" in reward-[0-9]*) REWARD="${l#reward-}" ;; esac
+          done
+          if ! printf '%s' "$REWARD" | grep -Eq '^[0-9]+(\.[0-9]{1,6})?$'; then
+            echo "::error::Reward '$REWARD' is not a number."; exit 1
+          fi
+          case "$TASKMARKET_NETWORK" in
+            tempo) CHAIN=4217; TOKEN=OUSD ;;
+            base)  CHAIN=8453; TOKEN=USDC ;;
+            *) echo "::error::TASKMARKET_NETWORK must be tempo or base."; exit 1 ;;
+          esac
+          BODY="$(printf '%s' "$ISSUE_BODY" | head -c 3500)"
+          {
+            printf '%s\n\n' "$ISSUE_TITLE"
+            printf '%s\n\n' "${BODY:-No description in the issue.}"
+            printf 'Source issue: %s\n' "$ISSUE_URL"
+            printf 'Deliver: open a pull request in %s that fixes #%s, then submit the pull request link on this task.\n' "$GH_REPO" "$ISSUE_NUMBER"
+            printf 'The maintainer accepts the submission whose pull request is merged.\n'
+          } > "$RUNNER_TEMP/description.txt"
+          { echo "REWARD=$REWARD"; echo "CHAIN=$CHAIN"; echo "TOKEN=$TOKEN"; } >> "$GITHUB_ENV"
+          echo "Task: $REWARD $TOKEN on $TASKMARKET_NETWORK, bounty, ${DURATION_HOURS}h"
+          cat "$RUNNER_TEMP/description.txt"
+
+      - name: Post the bounty (or dry run)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          TASKMARKET_HOME: ${{ runner.temp }}/taskmarket
+          # Only this step sees the key. In dry-run mode it is not needed at all.
+          TASKMARKET_IMPORT_KEY: ${{ secrets.TASKMARKET_PRIVATE_KEY }}
+        run: |
+          set -o pipefail
+          CMD=(taskmarket --network "$TASKMARKET_NETWORK" task create
+               --description "$(cat "$RUNNER_TEMP/description.txt")"
+               --reward "$REWARD" --duration "$DURATION_HOURS" --mode bounty --tags github,open-source)
+          if [ "$DRY_RUN" != "false" ]; then
+            taskmarket --version
+            taskmarket --network "$TASKMARKET_NETWORK" task create --help > /dev/null   # the flags below exist in this CLI
+            printf -v SHOWN '%q ' "${CMD[@]}"
+            echo "DRY RUN, nothing posted. Would run: $SHOWN"
+            {
+              echo "<!-- taskmarket-bounty:dry-run -->"
+              echo "**Taskmarket dry run.** Nothing was posted and no funds moved."
+              echo ""
+              echo "With \`TASKMARKET_DRY_RUN=false\` this label would post a **$REWARD $TOKEN** bounty on **$TASKMARKET_NETWORK** for **${DURATION_HOURS} h**, with the reward held in escrow until a submission is accepted:"
+              echo ""
+              echo '```'
+              echo "taskmarket --network $TASKMARKET_NETWORK task create --description <this issue> --reward $REWARD --duration $DURATION_HOURS --mode bounty --tags github,open-source"
+              echo '```'
+            } > "$RUNNER_TEMP/comment.md"
+          else
+            if [ -z "$TASKMARKET_IMPORT_KEY" ]; then
+              echo "::error::Set the repository secret TASKMARKET_PRIVATE_KEY (or keep TASKMARKET_DRY_RUN=true)."; exit 1
+            fi
+            taskmarket wallet import --yes > /dev/null
+            taskmarket --network "$TASKMARKET_NETWORK" wallet balance
+            "${CMD[@]}" | tee "$RUNNER_TEMP/create.json"
+            TASK_ID="$(jq -r 'select(.ok == true) | .data.taskId // empty' "$RUNNER_TEMP/create.json")"
+            if [ -z "$TASK_ID" ]; then echo "::error::Task was not created; see the output above."; exit 1; fi
+            URL="https://taskmarket.dev/tasks/$TASK_ID?chain=$CHAIN"
+            {
+              echo "<!-- taskmarket-bounty:posted -->"
+              echo "**Taskmarket bounty posted:** $URL"
+              echo ""
+              echo "Reward: $REWARD $TOKEN on $TASKMARKET_NETWORK, held in escrow until the maintainer accepts a submission. Open for ${DURATION_HOURS} h."
+              echo "To work on it: \`npm i -g @lucid-agents/taskmarket\`, then \`taskmarket --network $TASKMARKET_NETWORK task get $TASK_ID\`."
+            } > "$RUNNER_TEMP/comment.md"
+          fi
+
+      - name: Comment on the issue
+        if: steps.guard.outputs.skip != 'true'
+        run: gh issue comment "$ISSUE_NUMBER" --body-file "$RUNNER_TEMP/comment.md"
